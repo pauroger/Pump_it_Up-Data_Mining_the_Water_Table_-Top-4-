@@ -1,0 +1,391 @@
+---
+title: 'Pump it Up: Data Mining the Water Table challenge (Top 4%)'
+author: "Pau Roger Puig-Sureda"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+# Import Libraries
+
+```{r Initialization, echo = FALSE, include = FALSE}
+library(ggplot2)
+library(knitr)
+library(dplyr)
+library(plyr)
+library(lubridate)
+library(corrplot)
+library(rpart)
+library(caret)
+library(data.table)
+library(ggmap)
+```
+
+## Load the previously cleaned dataset
+
+```{r}
+colClasses = c("character","Date","factor","numeric","factor",
+               "numeric","numeric","factor","factor","integer","factor","factor",
+               "factor","factor","factor","factor",
+               "factor","factor","factor","factor","factor","factor",
+               "factor","factor","factor","factor","factor","factor",
+               "factor","factor")
+
+training_set = read.csv("R_cleaned_training_set.csv", header = TRUE, sep = ",", colClasses = colClasses)
+training_labels = read.csv("datasets/Training_set_labels.csv", header = TRUE, sep = ",",  colClasses = c("integer","factor"))
+test_set = read.csv("R_cleaned_test_set.csv", header = TRUE, sep = ",", colClasses = colClasses)
+```
+
+# Exploring the dataset
+
+Visualize the dataset in order to explore whether the location of the pump has any impact on its state or not.
+
+Plot the pumps in the map of Tanzania.
+
+```{r Pump location plot, warning=FALSE, message=FALSE}
+mapImageData <- get_googlemap(center = c(lon = median(training_set$longitude, na.rm = TRUE), lat = median(training_set$latitude, na.rm = TRUE)),
+ zoom = 6,
+ maptype = c("terrain"))
+
+ggmap(mapImageData, extent = "device") + 
+ geom_point(aes(x = longitude, y = latitude),
+ data = training_set[,c("longitude", "latitude")],
+ colour = "red",
+ size = 1,
+ pch = 20)
+```
+
+Plot the state of each pump.
+
+```{r Pump state plot}
+train_data <- merge(training_set, training_labels, by="id")
+train_data <- train_data[,c("id","longitude","latitude","status_group")]
+
+ggmap(mapImageData) + 
+ geom_point(aes(x = longitude, y = latitude, colour=status_group),
+ data = train_data[,c("longitude", "latitude","status_group")],
+ size = 1,
+ pch = 20)
+```
+
+It seems that there is not any clear relationship between the status of the pumps and their location.
+
+# Feature Engineering
+
+Based on the previous inspection of the dataset, engineer some features to increase the perfomance of the pump status classification.
+
+## Dates 
+
+As offered in the dataset they are not very useful. Nevertheless, it offers two interesting aspects about the water pump: how old the measurement is (the older, the less valuable) and in which month it has been recorded (some months might present a more challenging scenario for the pumps.
+
+Transform date_recorded to 3 different features: number of days until Jan 1st 2014, month recorded as factor, and day of the year recorded as numeric.
+
+```{r Transform date_recorded}
+date_recorded_offset_days <- as.numeric(as.Date("2014-01-01", format="%Y-%m-%d") - as.Date(training_set$date_recorded, format="%d/%m/%y"))
+date_recorded_month <- lubridate::month(training_set$date_recorded)
+day_of_year <- as.numeric(yday(training_set$date_recorded))
+training_set <- training_set[, -which(names(training_set) == "date_recorded")]
+training_set <- cbind(training_set, date_recorded_offset_days)
+training_set <- cbind(training_set, date_recorded_month)
+training_set <- cbind(training_set, day_of_year)
+
+date_recorded_offset_days <- as.numeric(as.Date("2014-01-01", format="%Y-%m-%d") - as.Date(test_set$date_recorded, format="%d/%m/%y"))
+date_recorded_month <- lubridate::month(test_set$date_recorded)
+day_of_year <- as.numeric(yday(test_set$date_recorded))
+test_set <- test_set[, -which(names(test_set) == "date_recorded")]
+test_set <- cbind(test_set, date_recorded_offset_days)
+test_set <- cbind(test_set, date_recorded_month)
+test_set <- cbind(test_set, day_of_year)
+```
+
+Some features that are subclasses of other features: `extraction_type_class`, `extraction_type_group` and `extraction_type`. Let's inspect their values to decide whether makes sense to keep them unmodified, to combine them, or to only select some of them.
+
+```{r Group by extraction}
+tally(group_by(training_set, extraction_type_class, extraction_type_group, extraction_type))
+```
+
+The middle level, `extraction_type_group`, does not provide much information than the other two levels. Therefore, we remove it. We also combine some of the smaller levels which does not provide useful information (i.e. india mark ii and india mark iii).
+
+```{r extraction_type_group cleaning}
+training_set <- mutate(training_set, extraction_type = revalue(extraction_type, 
+                                                               c("cemo" = "other motorpump",
+                            	                                   "climax" = "other motorpump",
+                            	                                   "other - play pump" = "other handpump",
+                            	                                   "walimi" = "other handpump",
+                            	                                   "other - swn 81" = "swn",
+                            	                                   "swn 80" = "swn",
+                            	                                   "india mark ii" = "india mark",
+                            	                                   "india mark iii" = "india mark")))
+
+training_set <- training_set[, -which(names(training_set) == "extraction_type_group")]
+
+test_set <- mutate(test_set, extraction_type = revalue(extraction_type, 
+                                                               c("cemo" = "other motorpump",
+                            	                                   "climax" = "other motorpump",
+                            	                                   "other - play pump" = "other handpump",
+                            	                                   "walimi" = "other handpump",
+                            	                                   "other - swn 81" = "swn",
+                            	                                   "swn 80" = "swn",
+                            	                                   "india mark ii" = "india mark",
+                            	                                   "india mark iii" = "india mark")))
+
+test_set <- test_set[, -which(names(test_set) == "extraction_type_group")]
+```
+
+In a similar way, `source`, `source_type` and `source_class` provide hiearchical information of the same aspect. We remove the middle level `source_type`.
+
+```{r source cleaning}
+tally(group_by(training_set, source, source_type, source_class))
+
+training_set <- training_set[, -which(names(training_set) == "source_type")]
+test_set <- test_set[, -which(names(test_set) == "source_type")]
+```
+
+Insepcting the `payment` and `payment_type` features, we can see that they share the same information (although some categories have been renamed). We keep `payment_type`.
+
+```{r payment cleaning}
+tally(group_by(training_set, payment_type, payment))
+
+training_set <- training_set[, -which(names(training_set) == "payment")]
+test_set <- test_set[, -which(names(test_set) == "payment")]
+```
+
+The `quality_group` and the `water_quality` features have similar information. We keep the more specific `water_quality`.
+
+```{r quality cleaning}
+tally(group_by(training_set, quality_group, water_quality))
+
+training_set <- training_set[, -which(names(training_set) == "quality_group")]
+test_set <- test_set[, -which(names(test_set) == "quality_group")]
+```
+
+Similarly, we keep the feature `waterpoint_type`, more precise than `waterpoint_type_group`.
+
+```{r waterpoint_type cleaning}
+tally(group_by(training_set, waterpoint_type_group, waterpoint_type))
+
+training_set <- training_set[, -which(names(training_set) == "waterpoint_type_group")]
+test_set <- test_set[, -which(names(test_set) == "waterpoint_type_group")]
+```
+
+Given that the features `quantity` y `quantity_group` have exactly the same information, we only keep `quantity`.
+
+```{r quantity cleaning}
+tally(group_by(training_set, quantity, quantity_group))
+
+training_set <- training_set[, -which(names(training_set) == "quantity_group")]
+test_set <- test_set[, -which(names(test_set) == "quantity_group")]
+```
+
+From <a href="https://www.expertafrica.com/tanzania/info/tanzania-weather-and-climate">Expert Africa</a>: <i> Tanzania has two rainy seasons: The short rains from late-October to late-December, a.k.a. the Mango Rains and the long rains from March to May</i>. Therefore, we are going to create this `season` variable.
+
+```{r Create saeson variable}
+training_set <- mutate(training_set, season = factor( ifelse( date_recorded_month <= 2, "dry short",
+                                                              ifelse( date_recorded_month <= 5, "wet long",
+                                                                      ifelse(date_recorded_month <= 9, "dry long", "wet short")))))
+
+test_set <- mutate(test_set, season = factor( ifelse( date_recorded_month <= 2, "dry short",
+                                                      ifelse( date_recorded_month <= 5, "wet long",
+                                                              ifelse(date_recorded_month <= 9, "dry long", "wet short")))))
+
+summary(training_set)
+```
+
+The feature `construction_year` a priori seems to be one of the most important ones: the older the pump, the more probable its failure. 
+The following figure shows the impact of this feature on the pump status.
+
+```{r plotting status_group by year}
+train_data <- merge(training_set,training_labels, by="id")
+
+ggplot(data = train_data, aes(x = construction_year)) + 
+  geom_bar(aes (fill=status_group), position = "fill") + 
+  xlab('')+ylab('') +
+  ggtitle('Pump Status by Year') +
+  scale_fill_brewer(palette="YlOrRd")
+```
+
+In order to increase the predictive power of the feature, we convert it to a factor and reduce the factor levels to 20. 
+
+```{r Reduce construction_year levels}
+NUM_LEVELS_CONSTRUCTION_YEAR = 20 
+training_set$construction_year <- factor(paste0("y",as.character(training_set$construction_year)))
+cyears <- names(summary(training_set$construction_year)[order(-summary(training_set$construction_year))][1:NUM_LEVELS_CONSTRUCTION_YEAR])
+cy <- factor(training_set$construction_year, levels=c(cyears, "Other"))
+cy[is.na(cy)] <- "Other"
+training_set$construction_year <- cy
+
+test_set$construction_year <- factor(paste0("y",as.character(test_set$construction_year)))
+cy <- factor(test_set$construction_year, levels=c(cyears, "Other"))
+cy[is.na(cy)] <- "Other"
+test_set$construction_year <- cy
+```
+
+The organization funding the pumps might have a great impact in their performance as well. Local authorities, closer to the communities, are expected to have better knowledge of the specific logistics and the actual need from the people. Consequently, the pumps funded by these local authorities should perform better.
+In this sense, we are going to create a new feature `funder_cat` that groups the funder in 5 categories (local_community, Tanzania_Gov, foreign_gov, UN_agencies and others).
+
+```{r Generate new feature funder_cat}
+fun<-as.character(training_set$funder)
+
+f_gov<-c('danida', 'A/co germany', 'belgian', 'british', 'england', 'german', 'germany',
+         'china', 'egypt', 'European Union', 'finland', 'japan', 'france', 'greec',
+         'netherlands', 'holland', 'holand', 'nethe', 'nethalan', 'netherla', 'netherlands',
+         'iran', 'irish', 'islam','italy', 'U.S.A', 'usa', 'usaid', 'swiss', 'swedish','korea', 'niger')
+NGO<-c('World Bank', 'Ngo', "Ngos", "Un","Un Habitat", "Un/wfp", "Undp", "Undp/aict", "Undp/ilo", "Unesco",                        
+       "Unhcr", "Unhcr/government", "Unice", "Unice/ Cspd", "Unicef", "Unicef/ Csp", "Unicef/african Muslim Agency", 
+       "Unicef/central", "Unicef/cspd", "Uniceg", "Unicet", "Unicrf", "Uniseg", "Unp/aict", "wwf", "wfp")
+local_commu <- unique(c(agrep('commu', training_set$funder, value=TRUE), 
+                        agrep('vill', training_set$funder, value=TRUE)))
+tanz_gov<- unique(c(agrep('Government of Tanzania', training_set$funder, value=TRUE),
+                    agrep('wsdp', training_set$funder, value=TRUE)))               
+unique(fun[agrep('wsdp', fun)])
+training_set$funder = as.character(training_set$funder)
+temp = training_set$funder
+
+for (i in 1:length(NGO)){
+  temp = replace(temp, 
+                 agrep(NGO[i], temp),
+                 'UN_agencies')
+}
+
+for (i in 1:length(f_gov)){
+  temp = replace(temp, 
+                 agrep(f_gov[i], temp),
+                 'foreign_gov')
+}
+
+for (i in 1:length(local_commu)){
+  temp = replace(temp, 
+                 agrep(local_commu[i], temp), 
+                 "local_community")
+}
+
+for (i in 1:length(tanz_gov)){
+  temp = replace(temp, 
+                 agrep(tanz_gov[i], temp), 
+                 "Tanzania_Gov")
+}
+
+temp = replace(temp, 
+               temp != "UN_agencies" & temp != 'foreign_gov' & temp != 'local_community' & temp != 'Tanzania_Gov',
+               'other')
+
+training_set$funder_cat<-factor(temp)
+
+test_set$funder = as.character(test_set$funder)
+
+temp = test_set$funder
+
+for (i in 1:length(NGO)){
+  temp = replace(temp, 
+                 agrep(NGO[i], temp),
+                 'UN_agencies')
+}
+
+for (i in 1:length(f_gov)){
+  temp = replace(temp, 
+                 agrep(f_gov[i], temp),
+                 'foreign_gov')
+}
+
+for (i in 1:length(local_commu)){
+  temp = replace(temp, 
+                 agrep(local_commu[i], temp), 
+                 "local_community")
+}
+
+for (i in 1:length(tanz_gov)){
+  temp = replace(temp, 
+                 agrep(tanz_gov[i], temp), 
+                 "Tanzania_Gov")
+}
+
+temp = replace(temp, 
+               temp != "UN_agencies" & temp != 'foreign_gov' & temp != 'local_community' & temp != 'Tanzania_Gov',
+               'other')
+
+test_set$funder_cat<-factor(temp)
+
+training_set$funder = factor(training_set$funder)
+test_set$funder = factor(test_set$funder)
+```
+
+As seen in the following figure, our assumption is confirmed. The more 'local' the funder, the better the performance of the pump.
+
+```{r plot funder_cat}
+train_data <- merge(training_set,training_labels, by="id")
+
+position <- c("local_community", "Tanzania_Gov", "other", "foreign_gov", "UN_agencies")
+ggplot(data = train_data, aes(x=funder_cat)) + 
+  geom_bar(aes(fill = status_group), position = "fill") + 
+  scale_x_discrete(limits = position) +
+  xlab('') + ylab('') + 
+  ggtitle('Pump Status by Funder Category') +
+  scale_fill_brewer(palette="YlOrRd")
+```
+
+Inspecting the funder column in more detail, it has hundreds, even thousands of values. However, many of the funders has very few pumps associated.
+
+```{r Inspect funder histogram}
+#Number of factors in the original funder data
+print(nlevels(training_set$funder))
+#Histogram of the original funder data
+tb <- table(training_set$funder)
+funderfac <- factor(training_set$funder, levels = names(tb[order(tb, decreasing = TRUE)]))
+qplot(funderfac, main = "Training Set") + theme(axis.text.x = element_blank(), axis.ticks = element_blank())
+
+#Number of factors in the original funder data
+print(nlevels(test_set$funder))
+#Histogram of the original funder data
+tb <- table(test_set$funder)
+funderfac <- factor(test_set$funder, levels = names(tb[order(tb, decreasing = TRUE)]))
+qplot(funderfac, main = "Test Set") + theme(axis.text.x = element_blank(), axis.ticks = element_blank())
+```
+
+We are going to take only the most important and leave the rest as "Other". 
+
+```{r Reduce funder levels}
+NUM_LEVELS_FUNDER = 15
+
+funderNames <- names(summary(training_set$funder)[1:NUM_LEVELS_FUNDER])
+funder <- factor(training_set$funder, levels=c(funderNames, "Other"))
+funder[is.na(funder)] <- "Other"
+training_set$funder <- funder
+
+funder <- factor(test_set$funder, levels=c(funderNames, "Other"))
+funder[is.na(funder)] <- "Other"
+test_set$funder <- funder
+```
+
+Same logic is applied to the Installer column: take only the most important features and leave the rest as "Other".
+
+```{r Reduce installer levels}
+NUM_LEVELS_INSTALLER = 15
+installerNames <- names(summary(training_set$installer)[1:NUM_LEVELS_INSTALLER])
+installer <- factor(training_set$installer, levels=c(installerNames, "Other"))
+installer[is.na(installer)] <- "Other"
+training_set$installer <- installer
+
+installer <- factor(test_set$installer, levels=c(installerNames, "Other"))
+installer[is.na(installer)] <- "Other"
+test_set$installer <- installer
+```
+
+Check that there is no more NA values in the dataset.
+
+```{r NAs After Check}
+sapply(training_set, function(x) sum(is.na(x)))
+```
+
+## Saving the feature engineered dataset
+
+```{r Final version}
+summary(training_set)
+summary(test_set)
+
+write.csv(training_set, file="processed_training_set.csv", row.names=FALSE)
+write.csv(test_set, file = "processed_test_set.csv", row.names=FALSE)
+```
