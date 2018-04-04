@@ -1,0 +1,263 @@
+---
+title: "Pump it Up: Data Mining the Water Table challenge (Top 4%)"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+author: Pau Roger Puig-Sureda
+---
+
+# Import Libraries
+
+```{r Initialization, echo=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(knitr)
+library(dplyr)
+library(plyr)
+library(corrplot)
+library(rpart)
+library(data.table)
+```
+
+# Introduction
+
+<b>Pump it Up: Data Mining the Water Table challenge</b> hosted by DrivenData, a platform for real world data challenges where data science can have positive social impact. For more information, please refer: <a href="https://www.drivendata.org/">https://www.drivendata.org/</a>
+
+# Goal
+
+The participants need to predict which water pumps are functional, which need to be repaired and which do not work at all among those included in the dataset. To that end, the dataset provides a set of information about the water pumps (provided by <a href="http://taarifa.org/">Taarifa</a> and the <a href="http://maji.go.tz/">Tanzanian Ministry of Water</a>), information valuable to predict their operating condition.
+
+# Data Loading
+
+Load the datasets and visualize their values to find possible missing values, mistakes in the data or aspect to focus when cleaning the dataset.
+
+```{r Load Dataset}
+colClasses = c("integer","numeric","Date","factor","numeric","factor",
+               "numeric","numeric","factor","integer","factor","factor",
+               "factor","factor","factor","factor","factor","numeric",
+               "logical","factor","factor","factor","logical","integer",
+               "factor","factor","factor","factor","factor","factor",
+               "factor","factor","factor","factor","factor","factor",
+               "factor","factor","factor","factor")
+
+training_set = read.csv(file = "datasets/Training_set_values.csv", header = TRUE, sep = ",", colClasses = colClasses)
+training_labels = read.csv("datasets/Training_set_labels.csv", header = TRUE, sep = ",",  colClasses = c("integer","factor"))
+test_set = read.csv("datasets/Test_set_values.csv", header = TRUE, sep = ",", colClasses = colClasses)
+
+# summary of the three datasets.
+summary(training_labels)
+summary(training_set)
+summary(test_set)
+```
+
+# Dataset Cleaning
+
+Based on some problems detected in the visualization of the dataset, this step focuses on cleaning the data to facilitate their later exploration and the feature engineering process, thus improving the predictive models performance.
+
+First of all, we are going to check the columns in the dataset with `NA's`.
+
+```{r Before Check}
+sapply(training_set, function(x) sum(is.na(x)))
+```
+
+As seen in the previous figure, only `permit` and `public_meeting` have `NAs`. As they are logical features (TRUE or FALSE), we are going to transform them into a factor and replace the NA values by unknown.
+
+```{r Logical Features Imputation}
+training_set$permit<- as.character(training_set$permit)
+training_set$permit[is.na(training_set$permit)]<-"unknown"
+training_set$permit<-as.factor(training_set$permit)
+
+test_set$permit<- as.character(test_set$permit)
+test_set$permit[is.na(test_set$permit)]<-"unknown"
+test_set$permit<-as.factor(test_set$permit)
+
+training_set$public_meeting<- as.character(training_set$public_meeting)
+training_set$public_meeting[is.na(training_set$public_meeting)]<-"unknown"
+training_set$public_meeting<-as.factor(training_set$public_meeting)
+
+test_set$public_meeting<- as.character(test_set$public_meeting)
+test_set$public_meeting[is.na(test_set$public_meeting)]<-"unknown"
+test_set$public_meeting<-as.factor(test_set$public_meeting)
+```
+
+We check that the NA values have been replaced.
+
+```{r NAs After Check}
+sapply(training_set, function(x) sum(is.na(x)))
+```
+
+Many waterpoints have a `gps_height` equal to 0. It seems that they are missing values that need to be imputed. Since the height of the gps point is related to its location (latitude and longitude), we are going to fit a decission tree on these features to predict a missing height based on the height of the closest points.
+
+```{r Height Imputation}
+heightFit <- rpart(gps_height ~ latitude + longitude, data=training_set[(training_set$gps_height!=0),], method="anova")
+training_set$gps_height[is.na(training_set$gps_height)] <- predict(heightFit, training_set[is.na(training_set$gps_height),])
+
+heightFit <- rpart(gps_height ~ latitude + longitude, data=test_set[(test_set$gps_height!=0),], method="anova")
+test_set$gps_height[is.na(test_set$gps_height)] <- predict(heightFit, test_set[is.na(test_set$gps_height),])
+```
+
+Next, `construction_year` includes values equal to 0 when it shouldn't.
+It appears that missing values or erroneous measurements have been corrected by setting 0 as value. Consequently, we mutate these 0 values to `NA's`, avoiding in this way their influence in later calculations.
+
+```{r Mutate 0 values}
+# Training set
+training_set <- mutate(training_set, construction_year = ifelse(construction_year == 0, NA, construction_year))
+
+# Test set
+test_set <- mutate(test_set, construction_year = ifelse(construction_year == 0, NA, construction_year))
+```
+
+Also, `population` has many values equal to zero, which appear to be missing values. To impute them, we are going to use the mean of the population.
+
+```{r Population Imputation}
+training_set$population[training_set$population==0]<- round(mean(training_set$population[training_set$population!=0]),digits = 0)
+test_set$population[test_set$population==0]<- round(mean(test_set$population[test_set$population!=0]),digits = 0)
+```
+
+The `longitude` of Tanzania goes from 29 to 40. So 0 is equivalent to an NA as the next scatter plot suggests.
+
+```{r Visualize Before GPS coordinates}
+ggplot(training_set, aes(x = longitude, y = latitude)) + geom_point(shape = 1)
+```
+
+To impute them, we are going to use the mean of the `latitude` and `longitude` of the other waterpoints in the same region.
+
+```{r Mutate GPS coordinates}
+# Impute training longitude
+longsummary <- aggregate(longitude~region,data=training_set[(training_set$longitude!=0),], FUN=mean)
+longsummary$region <- as.character(longsummary$region)
+for(i in 1:nrow(training_set)){
+  row <- training_set[i,]
+  if(row$longitude < 10){
+    new_longitude <- longsummary[longsummary$region == row$region,]$longitude
+    training_set[i,]$longitude <- new_longitude
+  }
+}
+
+# Impute test longitude
+longsummary <- aggregate(longitude~region,data=test_set[(test_set$longitude!=0),], FUN=mean)
+longsummary$region <- as.character(longsummary$region)
+for(i in 1:nrow(test_set)){
+  row <- test_set[i,]
+  if(row$longitude< 10){
+    new_longitude <- longsummary[longsummary$region == row$region,]$longitude
+    test_set[i,]$longitude <- new_longitude
+  }
+}
+
+# Impute train latitude
+latsummary <- aggregate(latitude~region,data=training_set[(training_set$latitude!=0),], FUN=mean)
+latsummary$region <- as.character(latsummary$region)
+for(i in 1:nrow(training_set)){
+  row <- training_set[i,]
+  if(row$latitude > -1e-06){
+    new_latitude <- latsummary[latsummary$region == row$region,]$latitude
+    training_set[i,]$latitude <- new_latitude
+  }
+  
+}
+
+# Impute test latitude
+latsummary <- aggregate(latitude~region,data=test_set[(test_set$latitude!=0),], FUN=mean)
+latsummary$region <- as.character(latsummary$region)
+for(i in 1:nrow(test_set)){
+  row <- test_set[i,]
+  if(row$latitude > -1e-06){
+    new_latitude <- latsummary[latsummary$region == row$region,]$latitude
+    test_set[i,]$latitude <- new_latitude
+  }
+  
+}
+```
+
+Let's visualize if we have corrected the location errors.
+
+```{r Visualize AfterGPS coordinates}
+ggplot(training_set, aes(x = longitude, y = latitude)) + geom_point(shape = 1)
+```
+
+Nice!
+
+ Some variables are not relevant for the prediction:
+
+- `amount_tsh` has 70% of missing values.
+- `num_private` is composed mostly of zeros.
+- `wpt_name` refers to the name of the water point, which seems irrelevant to the prediction of its status.
+- `scheme_name` includes the name of the waterpoint operator. `scheme_management` includes the same information but grouped by type, which seems more relevant to predict the status.
+ 
+```{r Remove num_private}
+training_set <- training_set[, -which(names(training_set) == "amount_tsh")]
+training_set <- training_set[, -which(names(training_set) == "num_private")]
+training_set <- training_set[, -which(names(training_set) == "wpt_name")]
+training_set <- training_set[, -which(names(training_set) == "scheme_name")]
+
+test_set <- test_set[, -which(names(test_set) == "amount_tsh")]
+test_set <- test_set[, -which(names(test_set) == "num_private")]
+test_set <- test_set[, -which(names(test_set) == "wpt_name")]
+test_set <- test_set[, -which(names(test_set) == "scheme_name")]
+```
+
+There are some other features that look like proxies/redundant of features included in the dataset, like, `region_code`, `district_code`, `ward`, `subvillage` and `lga` are proxies of `region`.
+
+```{r Remove region proxies}
+#region_code - remove
+training_set <- training_set[, -which(names(training_set) == "region_code")]
+test_set <- test_set[, -which(names(test_set) == "region_code")]
+
+#district_code - remove
+training_set <- training_set[, -which(names(training_set) == "district_code")]
+test_set <- test_set[, -which(names(test_set) == "district_code")]
+
+#ward - remove
+training_set <- training_set[, -which(names(training_set) == "ward")]
+test_set <- test_set[, -which(names(test_set) == "ward")]
+
+#lga - remove
+training_set <- training_set[, -which(names(training_set) == "subvillage")]
+test_set <- test_set[, -which(names(test_set) == "subvillage")]
+
+#lga - remove
+training_set <- training_set[, -which(names(training_set) == "lga")]
+test_set <- test_set[, -which(names(test_set) == "lga")]
+```
+
+The feature `recorded_by` has a unique value -GeoData Consultants-. Therefore, it does not provide any information for the later predictions.
+
+```{r Remove recorded_by}
+training_set <- training_set[, -which(names(training_set) == "recorded_by")]
+test_set <- test_set[, -which(names(test_set) == "recorded_by")]
+```
+
+The feature `scheme_management` has a level -None- that is not present in the test_set. Therefore, we change the value to -- (nothing).
+
+```{r Clean scheme_management}
+training_set$scheme_management[training_set$scheme_management=="None"] <- ""
+training_set$scheme_management <- factor(as.character(training_set$scheme_management))
+
+test_set$scheme_management[test_set$scheme_management=="None"] <- ""
+test_set$scheme_management <- factor(as.character(test_set$scheme_management))
+```
+
+In the same way, the feature "extraction_type" has a level "other - mkulima/shinyanga" that is not present in the test_set. Therefore, we change the value to "other".
+
+```{r Clean extraction_type}
+training_set$extraction_type[training_set$extraction_type=="other - mkulima/shinyanga"] <- "other"
+training_set$extraction_type <- factor(as.character(training_set$extraction_type))
+
+test_set$extraction_type[test_set$extraction_type=="other - mkulima/shinyanga"] <- "other"
+test_set$extraction_type <- factor(as.character(test_set$extraction_type))
+```
+
+```{r}
+summary(training_set)
+```
+
+# Saving cleaned dataset
+
+Finally, save the cleaned dataset.
+
+```{r}
+# Save the cleaned dataset
+write.csv(training_set, file="R_cleaned_training_set.csv", row.names=FALSE)
+write.csv(test_set, file="R_cleaned_test_set.csv", row.names=FALSE)
+```
