@@ -1,0 +1,183 @@
+---
+title: 'Pump it Up: Data Mining the Water Table challenge (Top 4%)'
+author: "Pau Roger Puig-Sureda"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+# Import Libraries
+
+```{r Initialization, echo = FALSE, include = FALSE}
+library(ggplot2)
+library(readr)
+library(knitr)
+library(dplyr)
+library(plyr)
+library(lubridate)
+library(corrplot)
+library(rpart)
+library(caret)
+library(data.table)
+library(ggmap)
+```
+
+## Load the previous dataset
+ 
+```{r Load engineered dataset}
+processedColClasses = c("character","factor","numeric","factor","numeric","numeric",
+               "factor","factor","numeric",
+               "factor","factor","factor","factor","factor",
+               "factor","factor","factor","factor","factor","factor",
+               "factor","factor","factor","numeric","numeric",
+               "numeric","factor","factor")
+
+training_set = read.csv("processed_training_set.csv", header = TRUE, sep = ",",  colClasses = processedColClasses)
+test_set = read.csv("processed_test_set.csv", header = TRUE, sep = ",", colClasses = processedColClasses)
+training_labels = read.csv("datasets/Training_set_labels.csv", header = TRUE, sep = ",",  colClasses = c("integer","factor"))
+
+training_set = merge(training_set, training_labels, by="id")
+```
+
+# Model Selection
+
+Let's define the caret training configuration that we are going to apply for the models: 5-fold cross validation, and to find tho optimal model, I set up 'grid'methodology. from random to grid.
+
+```{r Train control}
+train_control<- trainControl(method="cv", number=5,  search="grid", verboseIter = TRUE)
+```
+
+## Trees
+
+Trees are a powerful methodology for both classification and regression. They are especially well-suited for this data, where we expect that some subset of features to be especially representative for the target variable.
+
+We start with some basic tree model to set a performance baseline.
+
+```{r Single Decision Tree}
+cv.rpart<- train(as.factor(status_group)~., data=data.matrix(training_set),
+                 trControl=train_control,
+                 method="rpart", # rpart algorithm.
+                 metric="Accuracy", # We tell the model to try to optimize accuracy.
+                 tuneGrid= expand.grid(.cp=c(0.0001, 0.00001, 0.000001))) # Try different complexity values.
+```
+
+Cross-validated accuracy
+
+```{r Single Decision Tree Results}
+cv.rpart$results
+```
+
+Not bad for a basic decission tree.
+
+Let's check if more advanced methodologies are able to improve these results. 
+
+## Random Forest
+
+```{r Random Forest}
+cv.rf<- train(as.factor(status_group)~., data=data.matrix(training_set),
+                 trControl=train_control,
+                 method="rf", # Random Forest.
+                 metric="Accuracy",
+                 tuneGrid= expand.grid(.mtry=c(2,3,4,5,6,7,8,9,10,12,15)), # Number of features to be used for the random forest model.
+                 verbose=TRUE)
+```
+
+Cross-validated accuracy
+
+```{r Random Forest Results}
+cv.rf$results
+```
+
+Random Forest significantly improves the performance.
+
+Let's now check if boosting can improve even more this results. To that end, we are going to apply XGBoost to train a classification model. 
+
+## XGBoost
+
+```{r XGBoost}
+tuneGridXGB <- expand.grid(
+    nrounds=c(150),
+    max_depth = c(10,15,25,35),
+    eta = 0.05,
+    gamma = c(0.1, 1),
+    colsample_bytree = c(0.5,0.75),
+    subsample = c(0.50, 0.75),
+    min_child_weight = c(2,5))
+
+# train the xgboost learner
+cv.xgboost <- train(as.factor(status_group)~., data=data.matrix(training_set),
+    method = 'xgbTree',
+    metric = 'Accuracy',
+    trControl = train_control,
+    tuneGrid = tuneGridXGB)
+```
+
+Cross-validated results
+
+```{r XGBoost results}
+cv.xgboost$results
+```
+
+Pretty similar accuracy.
+
+## KNN
+
+I have finally tried KNN. Similar pumps are expected to have similar condition.
+
+```{r KNN}
+cv.knn <- train(as.factor(status_group)~., data=data.matrix(training_set),
+                method = "knn",
+                trControl = train_control,
+                preProcess = c("center","scale"),
+                tuneLength = 20,
+                tuneGrid= expand.grid(.k=c(2,5,10,25)))
+
+```
+
+Cross-validated results
+
+```{r KKN results}
+cv.knn$results
+```
+
+KNN is not able to reach the performance of the trees. 
+
+# Write Submission
+
+I have created two final predictions with the best models.
+
+- Random Forest
+
+```{r Random Forest Submission}
+submission_set = read.csv("datasets/SubmissionFormat.csv", header = TRUE, sep = ",")
+
+pred <- predict(cv.rf, data.matrix(test_set))
+submission <- data.frame(id = submission_set$id, y = pred)
+
+submission$status_group[submission$y == 1] <- "functional"
+submission$status_group[submission$y == 2] <- "functional needs repair"
+submission$status_group[submission$y == 3] <- "non functional"
+
+
+write.csv(submission[, which(names(submission) %in% c("id", "status_group"))], file = "rf-results.csv", row.names=FALSE, quote = FALSE)
+```
+
+0.8228 Best result! (Top 4%)
+
+- XGBoost
+
+```{r}
+pred <- predict(cv.xgboost, data.matrix(test_set))
+submission <- data.frame(id = submission_set$id, y = pred)
+
+submission$status_group[submission$y == 1] <- "functional"
+submission$status_group[submission$y == 2] <- "functional needs repair"
+submission$status_group[submission$y == 3] <- "non functional"
+
+
+write.csv(submission[ , which(names(submission) %in% c("id", "status_group"))], file = "xgb-results.csv", row.names=FALSE, quote = FALSE)
+```
